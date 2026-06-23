@@ -28,8 +28,10 @@ from langgraph.checkpoint.memory import MemorySaver
 # ---------------------------------------------------------------------
 # LLM + observability
 # ---------------------------------------------------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")            # 메인 추론(의도분석·상담·방송)
+LIGHT_MODEL = os.getenv("OPENAI_LIGHT_MODEL", "gpt-4o-mini")  # 경량: 카드 텍스트 정제용
 llm = init_chat_model(MODEL, temperature=0)
+llm_light = init_chat_model(LIGHT_MODEL, temperature=0)
 try:
     from langfuse.langchain import CallbackHandler
     CALLBACKS = [CallbackHandler()]
@@ -222,7 +224,9 @@ def cards_from_rpc(rows, top=6):
             "service_name": _na(r.get("service_name")),
             "field": _na(r.get("service_field")),
             "local": bool(r.get("is_local")),
-            "support": _clip(r.get("support_content")),
+            "one_liner": "",                                   # 경량모델 정제 후 채움
+            "support": _clip(r.get("support_content")),         # 정제 전 원문(요약본)
+            "support_raw": _clip(r.get("support_content"), 900),# 정제 입력용 원문
             "apply_method": _clip(r.get("apply_method"), 120) or "주민센터 방문/문의",
             "receiving_agency": _na(r.get("receiving_agency")) or "주민센터",
             "contact": _na(r.get("contact")),
@@ -231,6 +235,45 @@ def cards_from_rpc(rows, top=6):
             "confidence": _na(r.get("confidence")) or "참고",
             "matched": r.get("matched") or [],
         })
+    return cards
+
+# --- 경량 모델 카드 정제 (행정 원문 → 쉬운말 요약) ---
+class _PolishedItem(BaseModel):
+    index: int = Field(description="입력 카드의 index")
+    one_liner: str = Field(description="제도를 한 줄로 요약(누구에게 무엇을). 20자 내외")
+    support_clean: str = Field(description="지원내용을 어르신도 이해할 쉬운 말 2~3문장. 금액·대상 유지, 기호(○·-) 제거")
+
+class _PolishBatch(BaseModel):
+    items: list[_PolishedItem]
+
+def polish_cards(cards, callbacks=None):
+    """카드의 지원내용 원문을 경량 모델로 한 번에 정제. 실패 시 원문 유지."""
+    if not cards:
+        return cards
+    payload = [{"index": i,
+                "name": c.get("service_name", ""),
+                "raw": (c.get("support_raw") or c.get("support") or "")[:900]}
+               for i, c in enumerate(cards)]
+    sys = ("너는 복지 안내문을 디지털 취약계층(어르신 등)도 한 번에 이해하도록 다듬는 도우미다. "
+           "각 항목마다 (1) 한 줄 요약 one_liner, (2) 쉬운 말 2~3문장 support_clean 을 만들어라. "
+           "행정 기호(○, -, ※)와 중복을 없애고, 금액·대상·신청처 핵심은 반드시 유지하라. 새 정보를 지어내지 마라.")
+    try:
+        out = llm_light.with_structured_output(_PolishBatch).invoke(
+            [SystemMessage(content=sys),
+             HumanMessage(content=json.dumps(payload, ensure_ascii=False))],
+            config={"callbacks": callbacks or []})
+        by = {it.index: it for it in out.items}
+        for i, c in enumerate(cards):
+            it = by.get(i)
+            if it:
+                c["one_liner"] = it.one_liner.strip()
+                if it.support_clean.strip():
+                    c["support"] = it.support_clean.strip()
+            c.pop("support_raw", None)
+    except Exception as e:
+        print(f"카드 정제 스킵({e})")
+        for c in cards:
+            c.pop("support_raw", None)
     return cards
 
 def build_cards(gated, svc_map, service_fields, keywords=None, top=6):
@@ -272,8 +315,10 @@ def render_cards(cards, dialect=None):
     lines = []
     for c in cards:
         tag = "🏠우리동네 " if c["local"] else ""
+        one = f"   · {c['one_liner']}\n" if c.get("one_liner") else ""
         lines.append(
             f"[{c['rank']}] {tag}{c['service_name']}  ({c['confidence']})\n"
+            f"{one}"
             f"   - 지원: {c['support']}\n"
             f"   - 신청: {c['apply_method']} / 접수처: {c['receiving_agency']}\n"
             f"   - 문의: {c['contact']}  마감: {c['deadline']}\n"
@@ -430,6 +475,7 @@ def intake(state: WelfareState):
 
 def match(state: WelfareState):
     cards = DB.match(state["profile"], top=6)
+    cards = polish_cards(cards, callbacks=CALLBACKS)   # 경량 모델로 카드 텍스트 정제
     return {"candidates": cards, "cards": cards}
 
 def present(state: WelfareState):
@@ -486,6 +532,62 @@ _builder.add_edge("match", "present")
 _builder.add_edge("handoff", END)
 checkpointer = MemorySaver()
 citizen_graph = _builder.compile(checkpointer=checkpointer)
+
+# ---------------------------------------------------------------------
+# 방송 그래프 (Map-Reduce) — 발표 제외, 모듈/서버 호환 위해 유지
+# ---------------------------------------------------------------------
+REP_PROFILE = {
+    "elderly_rural": {"age": 73, "income_band": "50", "characteristics": ["single_household", "farmer"]},
+    "general":      {"age": 45, "income_band": "100", "characteristics": []},
+}
+
+def bregion(state: BroadcastState):
+    demo = state.get("demographic", "elderly_rural")
+    prof = dict(REP_PROFILE.get(demo, REP_PROFILE["general"]))
+    prof["region_sido"] = (state["region"] or {}).get("sido")
+    prof["region_sigungu"] = (state["region"] or {}).get("sigungu")
+    prof["region"] = state["region"]
+    return {"benefits": DB.match(prof, top=8)}
+
+def bselect(state: BroadcastState):
+    ranked = sorted(state["benefits"],
+                    key=lambda c: (c["local"], c["confidence"] == "확실"), reverse=True)
+    return {"benefits": ranked[:5]}
+
+def fan_out(state: BroadcastState):
+    return [Send("bdraft", {"benefit": b, "region": state["region"],
+                            "demographic": state.get("demographic", "")})
+            for b in state["benefits"]]
+
+def bdraft(state: BroadcastState):
+    b = state["benefit"]
+    dialect = DIALECT_MAP.get((state["region"] or {}).get("sido"))
+    sys = ("마을 스피커로 어르신들께 읽어드릴 30초 분량 복지 안내 멘트를 만드세요. "
+           "짧고 또렷한 문장, 제도명·대상·신청처·문의 전화를 분명히. ")
+    if dialect:
+        sys += f"{dialect} 말투를 살짝 입혀 정겹게."
+    text = (f"제도명:{b['service_name']} / 지원:{b['support']} / "
+            f"접수처:{b['receiving_agency']} / 문의:{b['contact']}")
+    seg = ask_llm([SystemMessage(content=sys), HumanMessage(content=text)]).content
+    return {"segments": [f"📢 {seg}"]}
+
+def bassemble(state: BroadcastState):
+    region = state["region"]
+    head = f"안녕하십니까, {region.get('sigungu','우리')} 주민 여러분. 오늘의 복지 소식입니다."
+    tail = "이상 복지 소식이었습니다. 신청은 가까운 주민센터에서 도와드립니다. 고맙습니다."
+    return {"script": "\n\n".join([head] + state["segments"] + [tail])}
+
+_bb = StateGraph(BroadcastState)
+_bb.add_node("bregion", bregion)
+_bb.add_node("bselect", bselect)
+_bb.add_node("bdraft", bdraft)
+_bb.add_node("bassemble", bassemble)
+_bb.add_edge(START, "bregion")
+_bb.add_edge("bregion", "bselect")
+_bb.add_conditional_edges("bselect", fan_out, ["bdraft"])
+_bb.add_edge("bdraft", "bassemble")
+_bb.add_edge("bassemble", END)
+broadcast_graph = _bb.compile()pointer)
 
 # ---------------------------------------------------------------------
 # 방송 그래프 (Map-Reduce)
