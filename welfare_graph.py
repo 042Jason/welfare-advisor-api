@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 welfare_graph.py — 복지 직권주의 추천 LangGraph 엔진 (서비스용 모듈).
-welfare_advisor.ipynb 의 코어를 임포트 가능한 형태로 정리.
 서버(app.py)가 citizen_graph / broadcast_graph 를 그대로 구동한다.
 """
 import os
@@ -26,10 +25,10 @@ from langgraph.types import interrupt, Command, Send
 from langgraph.checkpoint.memory import MemorySaver
 
 # ---------------------------------------------------------------------
-# LLM + observability
+# LLM
 # ---------------------------------------------------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")              # 메인 추론(의도분석·상담·방송)
-LIGHT_MODEL = os.getenv("OPENAI_LIGHT_MODEL", "gpt-4o-mini")  # 경량: 카드 텍스트 정제용
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")              # 메인 추론
+LIGHT_MODEL = os.getenv("OPENAI_LIGHT_MODEL", "gpt-4o-mini")  # 경량: 카드 정제
 llm = init_chat_model(MODEL, temperature=0)
 llm_light = init_chat_model(LIGHT_MODEL, temperature=0)
 try:
@@ -224,6 +223,8 @@ def cards_from_rpc(rows, top=6):
             "rank": rank,
             "service_name": _na(r.get("service_name")),
             "field": _na(r.get("service_field")),
+            "region_sido": _na(r.get("region_sido")),
+            "region_sigungu": _na(r.get("region_sigungu")),
             "local": bool(r.get("is_local")),
             "one_liner": "",
             "support": _clip(r.get("support_content")),
@@ -301,6 +302,7 @@ def build_cards(gated, svc_map, service_fields, keywords=None, top=6):
         cards.append({
             "rank": rank, "service_name": _na(s.get("service_name")),
             "field": _na(s.get("service_field")), "local": bool(s.get("_local")),
+            "region_sido": _na(s.get("region_sido")), "region_sigungu": _na(s.get("region_sigungu")),
             "one_liner": "",
             "support": _clip(_na(s.get("support_content")) or s.get("service_summary")),
             "support_raw": _clip(_na(s.get("support_content")) or s.get("service_summary"), 900),
@@ -434,6 +436,20 @@ def merge_consult(profile, consult):
     p["characteristics"] = sorted(set(p.get("characteristics") or []) | set(consult.get("characteristics") or []))
     return p
 
+def apply_region_from_text(profile, text):
+    """상담 문장에 지역(시도/시군구)이 있으면 그 지역으로 프로필 지역을 덮어쓴다.
+    → match_welfare 가 해당 지역(+전국 적용분)으로 추천을 좁힘."""
+    p = dict(profile)
+    rg = parse_region(text or "")
+    if rg.get("sido"):
+        p["region_sido"] = rg["sido"]
+        p["region_sigungu"] = rg.get("sigungu") or None
+    elif rg.get("sigungu"):
+        p["region_sigungu"] = rg["sigungu"]
+    if rg.get("sido") or rg.get("sigungu"):
+        p["region"] = {"sido": p.get("region_sido"), "sigungu": p.get("region_sigungu")}
+    return p
+
 def build_packet(state):
     prof = state.get("profile") or {}
     cards = state.get("cards") or []
@@ -474,6 +490,7 @@ def intake(state: WelfareState):
             profile["needs_text"] = ct
         except Exception as e:
             print(f"consult 추출 스킵: {e}")
+        profile = apply_region_from_text(profile, ct)   # 자연어로 말한 지역 → 그 지역으로 필터
     return {"form": form, "profile": profile}
 
 def match(state: WelfareState):
@@ -501,6 +518,7 @@ def present(state: WelfareState):
             prof = merge_consult(prof, extract_consult(txt))
         except Exception:
             pass
+        prof = apply_region_from_text(prof, txt)   # 상담에서 지역 언급 시 그 지역으로 재필터
         prof["needs_text"] = ((prof.get("needs_text") or "") + " | " + txt).strip(" |")
         return Command(goto="match",
                        update={"profile": prof, "feedback_round": state.get("feedback_round", 0) + 1})
@@ -522,7 +540,7 @@ def handoff(state: WelfareState):
             "messages": [AIMessage(content=easy_translate(note, dialect=_dialect(state)))]}
 
 # ---------------------------------------------------------------------
-# 시민 그래프 빌드 (서버: MemorySaver 로 interrupt 재개)
+# 시민 그래프 빌드
 # ---------------------------------------------------------------------
 _builder = StateGraph(WelfareState)
 _builder.add_node("intake", intake)
